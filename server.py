@@ -398,18 +398,18 @@ async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends
         model = genai.GenerativeModel("gemini-1.5-flash")
 
         # Send request to Gemini
-         prompt = (
-              "You are an expert makeup artist and color scientist.\n"
-              "Analyze the uploaded image and identify the exact lipstick color on the lips.\n"
-              "Consider realistic cosmetic tones, lighting, skin tone, hair color and visual context.\n"
-              "DO NOT describe the image.\n"
-              "DO NOT add explanations.\n\n"
-              "OUTPUT RULES (VERY IMPORTANT):\n"
-              "Return ONLY the lipstick RGB value in strict format:\n"
-              "R:### G:### B:###\n"
-              "No other text, no sentences, no punctuation, no comments.\n"
-              "Example output: R:201 G:60 B:85\n"
-          )
+        prompt = (
+            "You are an expert makeup artist and color scientist.\n"
+            "Analyze the uploaded image and identify the exact lipstick color on the lips.\n"
+            "Consider realistic cosmetic tones, lighting, skin tone, hair color and visual context.\n"
+            "DO NOT describe the image.\n"
+            "DO NOT add explanations.\n\n"
+            "OUTPUT RULES (VERY IMPORTANT):\n"
+            "Return ONLY the lipstick RGB value in strict format:\n"
+            "R:### G:### B:###\n"
+            "No other text, no sentences, no punctuation, no comments.\n"
+            "Example output: R:201 G:60 B:85\n"
+        )
 
         response = model.generate_content(
             [
