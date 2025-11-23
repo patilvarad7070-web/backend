@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from passlib.context import CryptContext
 import jwt
 from jwt.exceptions import InvalidTokenError
-
+import google.generativeai as genai
 from motor.motor_asyncio import AsyncIOMotorClient
 from PIL import Image
 import numpy as np
@@ -389,39 +389,55 @@ async def analyze_color(file: UploadFile = File(...), current_user: User = Depen
         suggested_name=suggested_name
     )
 
-# AI shade analysis (optional LLM). Always returns a useful payload — LLM optional.
 @api_router.post("/analyze/ai-shade")
 async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends(get_current_user)):
     try:
-        # Try to parse base64 image into bytes
+        # Convert base64 to bytes
         image_bytes = base64.b64decode(request.image_base64)
-        # Default local analysis
-        rgb = extract_dominant_color(image_bytes)
 
-        # If emergent LLM is available, attempt to call it (best-effort)
-        ai_text = None
-        if HAVE_EMERGENT:
-            try:
-                # Build a simple prompt; adapt to your LLM wrapper if needed
-                prompt = (
-                    "You are a makeup artist. Identify lipstick RGB in format 'R:### G:### B:###'.\n"
-                    "User profile: skin_tone={}, hair_color={}\n"
-                    "Image: provided.\n"
-                    "If exact RGB cannot be found, return the dominant color."
-                    .format(current_user.skin_tone or "unknown", current_user.hair_color or "unknown")
-                )
-                chat = LlmChat(api_key=os.environ.get("EMERGENT_LLM_KEY"))
-                # If the LlmChat API is different adapt accordingly - this is a best-effort call.
-                response = chat.create([UserMessage(prompt), ImageContent(image_bytes)])
-                ai_text = response.get("content") if isinstance(response, dict) else str(response)
-                # Try to parse R/G/B from ai_text
-                import re
-                m = re.search(r"R:?\s*(\d+)\s*G:?\s*(\d+)\s*B:?\s*(\d+)", ai_text)
-                if m:
-                    rgb = {"r": int(m.group(1)), "g": int(m.group(2)), "b": int(m.group(3))}
-            except Exception as e:
-                logger.warning("LLM analysis failed, falling back to local analysis: %s", str(e))
+        # Gemini vision model
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
+        # Send request to Gemini
+        
+            prompt = (
+    "You are an expert makeup artist and color scientist.\n"
+    "Analyze the uploaded image and identify the exact lipstick color on the lips.\n"
+    "Consider realistic cosmetic tones, lighting, skin tone, hair color and visual context.\n"
+    "DO NOT describe the image.\n"
+    "DO NOT add explanations.\n\n"
+    "OUTPUT RULES (VERY IMPORTANT):\n"
+    "Return ONLY the lipstick RGB value in strict format:\n"
+    "R:### G:### B:###\n"
+    "No other text, no sentences, no punctuation, no comments.\n"
+    "Example output: R:201 G:60 B:85\n"
+        )
+
+        response = model.generate_content(
+            [
+                {"role":"user","parts":[
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_bytes}
+               ]}
+            ]
+        )
+
+        # Extract RGB from Gemini response
+        import re
+        text = response.candidates[0].content.parts[0].text.strip()
+        match = re.search(r"R[: ]?(\d+)\s*G[: ]?(\d+)\s*B[: ]?(\d+)", text)
+
+        if match:
+            rgb = {
+                "r": int(match.group(1)),
+                "g": int(match.group(2)),
+                "b": int(match.group(3)),
+            }
+        else:
+            # fallback dominant color
+            rgb = extract_dominant_color(image_bytes)
+
+        # Convert values
         lab = rgb_to_lab(rgb["r"], rgb["g"], rgb["b"])
         hex_color = rgb_to_hex(rgb["r"], rgb["g"], rgb["b"])
         suggested_name = generate_shade_name(rgb)
@@ -431,12 +447,14 @@ async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends
             "lab_values": lab,
             "hex_color": hex_color,
             "suggested_name": suggested_name,
-            "ai_description": ai_text,
+            "ai_description": text,
             "analysis_type": request.analysis_type
         }
+
     except Exception as e:
-        logger.exception("analyze_ai_shade failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("AI shade analysis failed")
+        raise HTTPException(status_code=500, detail=f"AI Shade processing error: {str(e)}")
+
 
 # Device endpoints
 @api_router.post("/device/connect")
