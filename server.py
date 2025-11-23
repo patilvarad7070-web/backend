@@ -250,17 +250,19 @@ def generate_shade_name(rgb: dict) -> str:
 # Auth helpers
 # -------------------------------
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password[:72])
+    # Ensure password not longer than 72 bytes & encoded
+    password = password.encode("utf-8")[:72]
+    return pwd_context.hash(password)
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain[:72], hashed)
+    plain = plain.encode("utf-8")[:72]   # required by bcrypt
+    return pwd_context.verify(plain, hashed)
 
 def create_access_token(data: dict) -> str:
-    payload = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXP_MINUTES)
-    # PyJWT accepts datetime for exp, but convert to int timestamp for safety
-    payload.update({"exp": int(expire.timestamp())})
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    data.update({"exp": expire})
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+
     return token
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> User:
