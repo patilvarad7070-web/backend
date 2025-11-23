@@ -392,26 +392,24 @@ async def analyze_color(file: UploadFile = File(...), current_user: User = Depen
 @api_router.post("/analyze/ai-shade")
 async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends(get_current_user)):
     try:
-        # Convert base64 to bytes
         image_bytes = base64.b64decode(request.image_base64)
 
         # Gemini vision model
         model = genai.GenerativeModel("gemini-1.5-flash")
 
         # Send request to Gemini
-        
-            prompt = (
-    "You are an expert makeup artist and color scientist.\n"
-    "Analyze the uploaded image and identify the exact lipstick color on the lips.\n"
-    "Consider realistic cosmetic tones, lighting, skin tone, hair color and visual context.\n"
-    "DO NOT describe the image.\n"
-    "DO NOT add explanations.\n\n"
-    "OUTPUT RULES (VERY IMPORTANT):\n"
-    "Return ONLY the lipstick RGB value in strict format:\n"
-    "R:### G:### B:###\n"
-    "No other text, no sentences, no punctuation, no comments.\n"
-    "Example output: R:201 G:60 B:85\n"
-        )
+         prompt = (
+              "You are an expert makeup artist and color scientist.\n"
+              "Analyze the uploaded image and identify the exact lipstick color on the lips.\n"
+              "Consider realistic cosmetic tones, lighting, skin tone, hair color and visual context.\n"
+              "DO NOT describe the image.\n"
+              "DO NOT add explanations.\n\n"
+              "OUTPUT RULES (VERY IMPORTANT):\n"
+              "Return ONLY the lipstick RGB value in strict format:\n"
+              "R:### G:### B:###\n"
+              "No other text, no sentences, no punctuation, no comments.\n"
+              "Example output: R:201 G:60 B:85\n"
+          )
 
         response = model.generate_content(
             [
