@@ -258,12 +258,14 @@ def verify_password(plain: str, hashed: str) -> bool:
     plain = plain.encode("utf-8")[:72]   # required by bcrypt
     return pwd_context.verify(plain, hashed)
 
+ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
+
 def create_access_token(data: dict) -> str:
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    data.update({"exp": expire})
-    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+    to_encode = data.copy()
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-    return token
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> User:
     try:
