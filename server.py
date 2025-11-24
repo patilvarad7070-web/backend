@@ -48,7 +48,10 @@ load_dotenv(ROOT_DIR / ".env")
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "default_secret_key")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXP_MINUTES = int(os.environ.get("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))  # default 1 week
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
+CORS_ORIGINS =[
+    "https://aura-beauty-boutique.com",
+    "https://www.aura-beauty-boutique.com",
+    "https://app.aura-beauty-boutique.com",]
 
 
 # -------------------------------
@@ -96,7 +99,7 @@ async def shutdown_event():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
