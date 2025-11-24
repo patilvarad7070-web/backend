@@ -400,18 +400,43 @@ async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends
         # Gemini vision model
         model = genai.GenerativeModel("gemini-1.5-flash")
 
-        # Send request to Gemini
+        # Branch for event_look recommendations
+        if request.analysis_type == "event_look":
+            event_prompt = (
+                "Analyze this face photo and determine the skin tone, undertone, hair color, "
+                "and eye color. Based on these, recommend 3 lipstick shades that would be the most "
+                "flattering for the person. Return ONLY JSON format strictly like this:\n\n"
+                "{ \"skin_tone\":\"\", \"undertone\":\"\", \"hair_color\":\"\", \"eye_color\":\"\", "
+                "\"best_shades\":[\"Shade1\",\"Shade2\",\"Shade3\"] }\n\n"
+                "No explanations. No sentences. Only JSON."
+            )
+
+            response = model.generate_content(
+                [{"role":"user","parts":[event_prompt, {"mime_type":"image/jpeg","data":image_bytes}]}]
+            )
+
+            text = response.candidates[0].content.parts[0].text.strip()
+
+            try:
+                data = json.loads(text)  # Parse JSON safely
+            except:
+                raise HTTPException(status_code=500, detail="Failed to parse event look response")
+
+            # Convert recommended text shades to a default color placeholder
+            dummy_rgb = {"r": 150, "g": 80, "b": 120}
+            return {
+                "dominant_color": dummy_rgb,
+                "lab_values": rgb_to_lab(dummy_rgb["r"], dummy_rgb["g"], dummy_rgb["b"]),
+                "hex_color": rgb_to_hex(dummy_rgb["r"], dummy_rgb["g"], dummy_rgb["b"]),
+                "ai_description": data,
+                "analysis_type": request.analysis_type
+            }
+
+        # ---- Reference Look (lipstick match) ----
         prompt = (
-            "You are an expert makeup artist and color scientist.\n"
-            "Analyze the uploaded image and identify the exact lipstick color on the lips.\n"
-            "Consider realistic cosmetic tones, lighting, skin tone, hair color and visual context.\n"
-            "DO NOT describe the image.\n"
-            "DO NOT add explanations.\n\n"
-            "OUTPUT RULES (VERY IMPORTANT):\n"
-            "Return ONLY the lipstick RGB value in strict format:\n"
-            "R:### G:### B:###\n"
-            "No other text, no sentences, no punctuation, no comments.\n"
-            "Example output: R:201 G:60 B:85\n"
+            "You are an expert makeup artist and color scientist. Analyze the uploaded image and "
+            "identify ONLY the lipstick color in RGB.\n"
+            "Return strictly like this: R:### G:### B:###"
         )
 
         response = model.generate_content(
