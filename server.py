@@ -43,7 +43,14 @@ except Exception:
 # Config & environment
 # -------------------------------
 ROOT_DIR = Path(__file__).parent.resolve()
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env") 
+
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("Gemini API key not configured. Set GOOGLE_API_KEY in environment.")
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "default_secret_key")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
