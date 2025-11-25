@@ -405,7 +405,7 @@ async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends
         image_bytes = base64.b64decode(request.image_base64)
 
         # Gemini vision model
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
 
         # Branch for event_look recommendations
         if request.analysis_type == "event_look":
