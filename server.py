@@ -406,7 +406,7 @@ async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends
 
         # Gemini vision model
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         # Branch for event_look recommendations
         if request.analysis_type == "event_look":
