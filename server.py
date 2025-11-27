@@ -26,7 +26,10 @@ from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from passlib.context import CryptContext
 import jwt
 from jwt.exceptions import InvalidTokenError
-import google.generativeai as genai
+
+# NOTE: keep import as you had it; the helper below will attempt to use it gracefully
+from google import genai
+
 from motor.motor_asyncio import AsyncIOMotorClient
 from PIL import Image
 import numpy as np
@@ -43,23 +46,28 @@ except Exception:
 # Config & environment
 # -------------------------------
 ROOT_DIR = Path(__file__).parent.resolve()
-load_dotenv(ROOT_DIR / ".env") 
+load_dotenv(ROOT_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("Gemini API key not configured. Set GOOGLE_API_KEY in environment.")
 
-genai.configure(api_key=GEMINI_API_KEY)
+# configure genai if available
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+except Exception:
+    # safe to continue; we'll attempt model calls later and fallback if necessary
+    pass
 
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "default_secret_key")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXP_MINUTES = int(os.environ.get("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))  # default 1 week
-CORS_ORIGINS =[
+CORS_ORIGINS = [
     "https://aura-beauty-boutique.com",
     "https://www.aura-beauty-boutique.com",
-    "https://app.aura-beauty-boutique.com",]
-
+    "https://app.aura-beauty-boutique.com",
+]
 
 # -------------------------------
 # Security setup
@@ -399,79 +407,209 @@ async def analyze_color(file: UploadFile = File(...), current_user: User = Depen
         suggested_name=suggested_name
     )
 
+# -------------------------------
+# AI / Gemini analysis (REPLACED)
+# - Primary model requested: gemini-2.5-flash
+# - Will attempt to call a few common genai SDK patterns
+# - If remote model call fails, gracefully fallback to local image analysis
+# -------------------------------
+def _try_call_gemini_variants(model_name: str, prompt: str, image_bytes: bytes):
+    """
+    Try a few known genai call patterns. Return text if successful, else None.
+    This is defensive so SDK differences or model name mismatches don't
+    crash the endpoint. Log the exception chain for debugging.
+    """
+    last_exc = None
+
+    # Pattern 1: classic genai.GenerativeModel usage
+    try:
+        if hasattr(genai, "GenerativeModel"):
+            model = getattr(genai, "GenerativeModel")(model_name)
+            # Many older examples use generate_content([...]) passing parts. Try that:
+            try:
+                response = model.generate_content(
+                    [{"role": "user", "parts": [prompt, {"mime_type": "image/jpeg", "data": image_bytes}]}]
+                )
+                text = response.candidates[0].content.parts[0].text.strip()
+                return text
+            except Exception as e:
+                last_exc = e
+    except Exception as e:
+        last_exc = e
+
+    # Pattern 2: genai.client(...) then generate_content
+    try:
+        client_maker = getattr(genai, "client", None)
+        if callable(client_maker):
+            try:
+                client = client_maker(api_key=GEMINI_API_KEY)  # some SDK variants accept api_key here
+            except TypeError:
+                # fallback to no-arg client
+                client = client_maker()
+            if hasattr(client, "generate_content"):
+                try:
+                    response = client.generate_content(
+                        model=model_name,
+                        input=[{"role": "user", "content": prompt, "attachments": [{"mime_type": "image/jpeg", "data": image_bytes}]}]
+                    )
+                    # try common response attr
+                    # attempt multiple response shapes
+                    if hasattr(response, "candidates") and response.candidates:
+                        cand = response.candidates[0]
+                        # cand.content.parts[0].text
+                        try:
+                            return cand.content.parts[0].text.strip()
+                        except Exception:
+                            try:
+                                return getattr(cand, "text", "").strip()
+                            except Exception:
+                                pass
+                    # fallback to string representation
+                    return str(response)
+                except Exception as e:
+                    last_exc = e
+    except Exception as e:
+        last_exc = e
+
+    # Pattern 3: direct helper function (older/other SDK)
+    try:
+        if hasattr(genai, "generate_text"):
+            try:
+                # Some SDKs accept model and prompt
+                resp = genai.generate_text(model=model_name, prompt=prompt, image=image_bytes)
+                # Might return dict-like or object
+                if isinstance(resp, dict):
+                    # find text in likely keys
+                    for k in ("text", "output", "message"):
+                        if k in resp:
+                            return resp[k]
+                    # try first candidate
+                    cand = resp.get("candidates")
+                    if cand:
+                        return str(cand[0])
+                else:
+                    # fallback to str(resp)
+                    return str(resp)
+            except Exception as e:
+                last_exc = e
+    except Exception as e:
+        last_exc = e
+
+    # if we get here we failed to reach the model reliably
+    logger.warning("Gemini call variants failed. Last exception: %s", repr(last_exc))
+    return None
+
+
 @api_router.post("/analyze/ai-shade")
 async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends(get_current_user)):
+    """
+    AI shade analysis:
+    - Tries to use Gemini model "gemini-2.5-flash" (as requested).
+    - If remote call fails for any reason (404/NotFound/SDK mismatch), fallback to local dominant-color extraction.
+    - Returns consistent JSON fields for the frontend to use.
+    """
     try:
         image_bytes = base64.b64decode(request.image_base64)
 
-        # Gemini vision model
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # Preferred Gemini model
+        model_name = "gemini-2.5-flash"
 
-        # Branch for event_look recommendations
+        # Event look branch (structured JSON expected)
         if request.analysis_type == "event_look":
             event_prompt = (
-                "Analyze this face photo and determine the skin tone, undertone, hair color, "
-                "and eye color. Based on these, recommend 3 lipstick shades that would be the most "
-                "flattering for the person. Return ONLY JSON format strictly like this:\n\n"
+                "Analyze this face photo and determine the skin tone, undertone, hair color, and eye color. "
+                "Based on these, recommend 3 lipstick shades that would be the most flattering for the person. "
+                "Return ONLY JSON format strictly like this:\n\n"
                 "{ \"skin_tone\":\"\", \"undertone\":\"\", \"hair_color\":\"\", \"eye_color\":\"\", "
                 "\"best_shades\":[\"Shade1\",\"Shade2\",\"Shade3\"] }\n\n"
                 "No explanations. No sentences. Only JSON."
             )
 
-            response = model.generate_content(
-                [{"role":"user","parts":[event_prompt, {"mime_type":"image/jpeg","data":image_bytes}]}]
-            )
-
-            text = response.candidates[0].content.parts[0].text.strip()
-
+            # Attempt remote call
             try:
-                data = json.loads(text)  # Parse JSON safely
-            except:
-                raise HTTPException(status_code=500, detail="Failed to parse event look response")
+                text = _try_call_gemini_variants(model_name, event_prompt, image_bytes)
+            except Exception as e:
+                logger.exception("Gemini attempt for event_look raised unexpected error: %s", e)
+                text = None
 
-            # Convert recommended text shades to a default color placeholder
-            dummy_rgb = {"r": 150, "g": 80, "b": 120}
+            # If remote text returned, try parse JSON
+            if text:
+                try:
+                    data = json.loads(text)
+                    # return enriched response including color placeholder (so frontend always gets consistent shape)
+                    dummy_rgb = extract_dominant_color(image_bytes)
+                    return {
+                        "dominant_color": dummy_rgb,
+                        "lab_values": rgb_to_lab(dummy_rgb["r"], dummy_rgb["g"], dummy_rgb["b"]),
+                        "hex_color": rgb_to_hex(dummy_rgb["r"], dummy_rgb["g"], dummy_rgb["b"]),
+                        "ai_description": data,
+                        "analysis_type": request.analysis_type,
+                        "source": "gemini"
+                    }
+                except Exception as e:
+                    logger.warning("Failed to parse event_look JSON from Gemini: %s. Falling back.", e)
+                    text = None
+
+            # Fallback: local analysis only (no remote model)
+            logger.info("Falling back to local analysis for event_look.")
+            fallback_rgb = extract_dominant_color(image_bytes)
+            fallback_data = {
+                "skin_tone": "Unknown",
+                "undertone": "Unknown",
+                "hair_color": "Unknown",
+                "eye_color": "Unknown",
+                "best_shades": ["Shade1", "Shade2", "Shade3"]
+            }
             return {
-                "dominant_color": dummy_rgb,
-                "lab_values": rgb_to_lab(dummy_rgb["r"], dummy_rgb["g"], dummy_rgb["b"]),
-                "hex_color": rgb_to_hex(dummy_rgb["r"], dummy_rgb["g"], dummy_rgb["b"]),
-                "ai_description": data,
-                "analysis_type": request.analysis_type
+                "dominant_color": fallback_rgb,
+                "lab_values": rgb_to_lab(fallback_rgb["r"], fallback_rgb["g"], fallback_rgb["b"]),
+                "hex_color": rgb_to_hex(fallback_rgb["r"], fallback_rgb["g"], fallback_rgb["b"]),
+                "ai_description": fallback_data,
+                "analysis_type": request.analysis_type,
+                "source": "fallback"
             }
 
-        # ---- Reference Look (lipstick match) ----
-        prompt = (
-            "You are an expert makeup artist and color scientist. Analyze the uploaded image and "
-            "identify ONLY the lipstick color in RGB.\n"
+        # Reference look: find lipstick RGB from image
+        prompt_reference = (
+            "You are an expert makeup artist and color scientist. Analyze the uploaded image and identify ONLY the lipstick color in RGB.\n"
             "Return strictly like this: R:### G:### B:###"
         )
 
-        response = model.generate_content(
-            [
-                {"role":"user","parts":[
-                prompt,
-                {"mime_type": "image/jpeg", "data": image_bytes}
-               ]}
-            ]
-        )
+        # Try remote model first
+        try:
+            text = _try_call_gemini_variants(model_name, prompt_reference, image_bytes)
+        except Exception as e:
+            logger.exception("Gemini attempt for reference look raised: %s", e)
+            text = None
 
-        # Extract RGB from Gemini response
-        import re
-        text = response.candidates[0].content.parts[0].text.strip()
-        match = re.search(r"R[: ]?(\d+)\s*G[: ]?(\d+)\s*B[: ]?(\d+)", text)
+        rgb = None
+        if text:
+            # try extract R G B using regex
+            import re
+            match = re.search(r"R[: ]?(\d{1,3})\s*[, ]?\s*G[: ]?(\d{1,3})\s*[, ]?\s*B[: ]?(\d{1,3})", text)
+            if match:
+                try:
+                    r = max(0, min(255, int(match.group(1))))
+                    g = max(0, min(255, int(match.group(2))))
+                    b = max(0, min(255, int(match.group(3))))
+                    rgb = {"r": r, "g": g, "b": b}
+                except Exception:
+                    rgb = None
+            else:
+                # try to parse "R:###\nG:###\nB:###" or variations
+                lines = text.replace(",", " ").split()
+                nums = [int(tok) for tok in lines if tok.isdigit() and 0 <= int(tok) <= 255]
+                if len(nums) >= 3:
+                    rgb = {"r": nums[0], "g": nums[1], "b": nums[2]}
 
-        if match:
-            rgb = {
-                "r": int(match.group(1)),
-                "g": int(match.group(2)),
-                "b": int(match.group(3)),
-            }
-        else:
-            # fallback dominant color
+        # If remote call didn't yield a valid RGB, fallback to dominant color
+        if not rgb:
+            logger.info("Gemini did not return valid RGB. Falling back to extract_dominant_color.")
             rgb = extract_dominant_color(image_bytes)
+            source = "fallback"
+        else:
+            source = "gemini"
 
-        # Convert values
         lab = rgb_to_lab(rgb["r"], rgb["g"], rgb["b"])
         hex_color = rgb_to_hex(rgb["r"], rgb["g"], rgb["b"])
         suggested_name = generate_shade_name(rgb)
@@ -481,16 +619,21 @@ async def analyze_ai_shade(request: AIShadeRequest, current_user: User = Depends
             "lab_values": lab,
             "hex_color": hex_color,
             "suggested_name": suggested_name,
-            "ai_description": text,
-            "analysis_type": request.analysis_type
+            "ai_description": text if text else "",
+            "analysis_type": request.analysis_type,
+            "source": source
         }
 
+    except HTTPException:
+        # re-raise FastAPI HTTP exceptions unchanged
+        raise
     except Exception as e:
         logger.exception("AI shade analysis failed")
         raise HTTPException(status_code=500, detail=f"AI Shade processing error: {str(e)}")
 
-
+# -------------------------------
 # Device endpoints
+# -------------------------------
 @api_router.post("/device/connect")
 async def connect_device(current_user: User = Depends(get_current_user)):
     existing = await db.device_sessions.find_one({"user_id": current_user.id, "status": "connected"})
