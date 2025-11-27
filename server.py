@@ -54,6 +54,7 @@ CORS_ORIGINS = [
     "https://aura-beauty-boutique.com",
     "https://www.aura-beauty-boutique.com",
     "https://app.aura-beauty-boutique.com",
+    "https://api.aura-beauty-boutique.com",
 ]
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -103,6 +104,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # -------------------------------
