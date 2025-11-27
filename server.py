@@ -210,6 +210,63 @@ async def get_user(auth: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(401, "Invalid token")
 
 # -------------------------------
+# Auth Routes
+# -------------------------------
+@api_router.post("/auth/register")
+async def register(user_data: UserRegister):
+    existing = await db.users.find_one({"email": user_data.email})
+    if existing:
+        raise HTTPException(400, "Email already exists")
+
+    user_id = str(uuid.uuid4())
+    hashed = hash_pw(user_data.password)
+
+    doc = {
+        "id": user_id,
+        "email": user_data.email,
+        "full_name": user_data.full_name,
+        "password_hash": hashed,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    await db.users.insert_one(doc)
+    token = create_token({"sub": user_id})
+
+    return {"token": token, "user": doc}
+
+
+@api_router.post("/auth/login")
+async def login(credentials: UserLogin):
+    user = await db.users.find_one({"email": credentials.email})
+    if not user:
+        raise HTTPException(401, "Invalid credentials")
+
+    if not verify_pw(credentials.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+
+    token = create_token({"sub": user["id"]})
+    user.pop("password_hash", None)
+    return {"token": token, "user": user}
+
+
+@api_router.get("/auth/me")
+async def me(user: User = Depends(get_user)):
+    return user
+
+
+@api_router.put("/auth/profile")
+async def update_profile(profile: UserProfile, user: User = Depends(get_user)):
+    update = {}
+    if profile.skin_tone: update["skin_tone"] = profile.skin_tone
+    if profile.hair_color: update["hair_color"] = profile.hair_color
+
+    if update:
+        await db.users.update_one({"id": user.id}, {"$set": update})
+
+    return {"message": "Profile updated"}
+
+
+# -------------------------------
 # AI HANDLERS — LATEST GEMINI 2.5 FLASH
 # -------------------------------
 
