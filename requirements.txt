@@ -8,7 +8,7 @@ pillow==10.3.0
 numpy==1.26.4
 scikit-learn==1.5.1
 passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
+bcrypt==4.1.2
 pyjwt==2.8.0
 python-multipart==0.0.9
 email-validator==2.1.1
