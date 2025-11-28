@@ -426,19 +426,28 @@ async def analyze_ai(req:AIShadeRequest,user:User=Depends(get_current_user)):
             "source":"ai" if (HAVE_GENAI and GEMINI_API_KEY) else "local"
         }
 
-    if req.analysis_type=="event_look":
-        data=await run_event_look(img)
-        dom=extract_dominant_color(img)
-     return {
-    "dominant_color": {"r": dom["r"], "g": dom["g"], "b": dom["b"]},
-    "lab_values": rgb_to_lab(dom["r"], dom["g"], dom["b"]),
-    "hex_color": rgb_to_hex(dom["r"], dom["g"], dom["b"]),
-    "ai_description": f"Recommended shades: {', '.join(data['best_shades'])}",
-    "analysis": data,
-    "source": "ai" if (HAVE_GENAI and GEMINI_API_KEY) else "local"
-}
+    # -------------------------------
+    # EVENT LOOK
+    # -------------------------------
+    if req.analysis_type == "event_look":
+        data = await run_event_look(img)
 
-    raise HTTPException(400,"Invalid analysis_type")
+        # use extracted dominant color for preview
+        dom = extract_dominant_color(img)
+
+        return {
+            "dominant_color": {"r": dom["r"], "g": dom["g"], "b": dom["b"]},
+            "lab_values": rgb_to_lab(dom["r"], dom["g"], dom["b"]),
+            "hex_color": rgb_to_hex(dom["r"], dom["g"], dom["b"]),
+            "ai_description": f"Recommended shades: {', '.join(data['best_shades'])}",
+            "analysis": data,
+            "source": "ai" if (HAVE_GENAI and GEMINI_API_KEY) else "local"
+        }
+
+    # -------------------------------
+    # INVALID TYPE
+    # -------------------------------
+    raise HTTPException(400, "Invalid analysis_type")
 
 # -------------------------------
 # Root
