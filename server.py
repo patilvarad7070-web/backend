@@ -1,9 +1,8 @@
-# service.py
 # ================================================================
-# Aura bespoke backend — unified final service
+# Aura bespoke backend — unified final service (2025-11-28)
 # - FastAPI + Motor (MongoDB)
 # - JWT auth (PyJWT), passlib bcrypt
-# - Gemini image analysis with robust fallback to local extraction
+# - Gemini image analysis with fallback to local extraction
 # - Color analysis (PIL + numpy + sklearn KMeans)
 # - Shades + Device endpoints (compatible with frontend)
 # ================================================================
@@ -15,15 +14,15 @@ import json
 import asyncio
 import logging
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Optional, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, File, UploadFile, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from pydantic import BaseModel, EmailStr, ConfigDict
 from passlib.context import CryptContext
 import jwt
 
@@ -32,7 +31,7 @@ from PIL import Image
 import numpy as np
 from sklearn.cluster import KMeans
 
-# Optional: google generative ai (Gemini)
+# Optional: google generative ai
 try:
     import google.generativeai as genai
     HAVE_GENAI = True
@@ -40,16 +39,18 @@ except Exception:
     HAVE_GENAI = False
 
 # -------------------------------
-# Load env
+# Load ENV
 # -------------------------------
 ROOT_DIR = Path(__file__).parent.resolve()
 load_dotenv(ROOT_DIR / ".env")
 
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+MONGO_URL = os.getenv("MONGO_URL")
 DB_NAME = os.getenv("DB_NAME", "aura_beauty")
+
 JWT_SECRET = os.getenv("JWT_SECRET_KEY", "default_secret_key")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_ALGORITHM = "HS256"
 JWT_EXP_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24 * 7))
+
 CORS_ORIGINS = [
     "https://aura-beauty-boutique.com",
     "https://www.aura-beauty-boutique.com",
@@ -58,14 +59,13 @@ CORS_ORIGINS = [
 ]
 
 GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-if HAVE_GENAI and not GEMINI_API_KEY:
-    # Do not crash if missing; we will fallback to local extraction when called
-    logging.warning("GENAI present but GEMINI API key not configured. AI calls will failover to local extraction.")
 if HAVE_GENAI and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+elif HAVE_GENAI:
+    logging.warning("Gemini SDK installed but API key missing. AI will fallback to local.")
 
 # -------------------------------
-# App setup
+# FastAPI setup
 # -------------------------------
 app = FastAPI(title="Aura Backend")
 api = APIRouter(prefix="/api")
@@ -82,13 +82,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
 # -------------------------------
-# Database
+# MongoDB
 # -------------------------------
-client: Optional[AsyncIOMotorClient] = None
+client = None
 db = None
 
 async def connect_to_mongo():
@@ -97,29 +96,23 @@ async def connect_to_mongo():
         client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=3000)
         await client.server_info()
         db = client[DB_NAME]
-        logger.info("✅ Connected to MongoDB")
+        logger.info("✅ MongoDB connected")
     except Exception as e:
-        logger.error("Mongo connection failed: %s", e)
-        # retry with backoff
+        logger.error(f"MongoDB failed: {e}")
         await asyncio.sleep(2)
         await connect_to_mongo()
 
-async def close_mongo():
-    global client
-    if client:
-        client.close()
-        logger.info("🛑 MongoDB connection closed")
-
 @app.on_event("startup")
-async def on_startup():
+async def startup():
     await connect_to_mongo()
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    await close_mongo()
+async def shutdown():
+    if client:
+        client.close()
 
 # -------------------------------
-# Pydantic models
+# Pydantic Models
 # -------------------------------
 class UserRegister(BaseModel):
     email: EmailStr
@@ -135,9 +128,9 @@ class User(BaseModel):
     id: str
     email: str
     full_name: str
+    created_at: datetime
     skin_tone: Optional[str] = None
     hair_color: Optional[str] = None
-    created_at: datetime
 
 class UserProfile(BaseModel):
     skin_tone: Optional[str] = None
@@ -151,476 +144,302 @@ class ShadeCreate(BaseModel):
     source: str = "manual"
 
 class AIShadeRequest(BaseModel):
-    image_base64: Optional[str] = None
+    image_base64: str
     analysis_type: str  # "reference_look" | "event_look"
 
 # -------------------------------
-# Utilities: security + tokens
+# Auth Helpers
 # -------------------------------
 def hash_password(password: str) -> str:
-    # limit to 72 bytes for bcrypt safety
-    pw = password.encode("utf-8")[:72].decode("utf-8", errors="ignore")
-    return pwd_context.hash(pw)
+    return pwd_context.hash(password[:72])
 
 def verify_password(plain: str, hashed: str) -> bool:
-    pw = plain.encode("utf-8")[:72].decode("utf-8", errors="ignore")
-    return pwd_context.verify(pw, hashed)
+    return pwd_context.verify(plain[:72], hashed)
 
 def create_token(data: dict) -> str:
     expire = datetime.utcnow() + timedelta(minutes=JWT_EXP_MINUTES)
-    payload = data.copy()
-    payload.update({"exp": int(expire.timestamp()), "iat": int(datetime.utcnow().timestamp())})
+    payload = {**data, "exp": int(expire.timestamp()), "iat": int(datetime.utcnow().timestamp())}
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    if isinstance(token, bytes):
-        token = token.decode("utf-8")
-    return token
+    return token if isinstance(token, str) else token.decode()
 
 async def get_current_user(auth: HTTPAuthorizationCredentials = Depends(security)) -> User:
     token = auth.credentials
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
-        if db is None:
-            raise HTTPException(status_code=500, detail="Database not initialized")
-        user_doc = await db.users.find_one({"id": user_id})
+        uid = payload.get("sub")
+        user_doc = await db.users.find_one({"id": uid})
         if not user_doc:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+            raise HTTPException(401, "User not found")
+
         user_doc.pop("_id", None)
-        # normalize created_at
-        if isinstance(user_doc.get("created_at"), str):
-            try:
-                user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
-            except Exception:
-                user_doc["created_at"] = datetime.utcnow()
         user_doc.pop("password_hash", None)
+
+        if isinstance(user_doc.get("created_at"), str):
+            user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
+
         return User(**user_doc)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except Exception as e:
-        logger.debug("get_current_user failed: %s", e)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    except Exception:
+        raise HTTPException(401, "Invalid or expired token")
 
 # -------------------------------
-# Color utils
+# Color Utilities
 # -------------------------------
-def rgb_to_hex(r, g, b) -> str:
-    return "#{:02x}{:02x}{:02x}".format(int(r), int(g), int(b))
+def rgb_to_hex(r, g, b): return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
 def rgb_to_lab(r, g, b):
-    r_n, g_n, b_n = [x / 255.0 for x in (r, g, b)]
-    def linearize(c):
-        return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
-    r_l, g_l, b_l = [linearize(c) for c in (r_n, g_n, b_n)]
-    x = r_l * 0.4124 + g_l * 0.3576 + b_l * 0.1805
-    y = r_l * 0.2126 + g_l * 0.7152 + b_l * 0.0722
-    z = r_l * 0.0193 + g_l * 0.1192 + b_l * 0.9505
-    x /= 0.95047; z /= 1.08883
-    def f(t):
-        return t ** (1/3) if t > 0.008856 else (7.787 * t) + (16.0 / 116.0)
-    L = max(0.0, (116.0 * f(y)) - 16.0)
-    a = 500.0 * (f(x) - f(y))
-    b_val = 200.0 * (f(y) - f(z))
-    return {"l": round(L, 2), "a": round(a, 2), "b": round(b_val, 2)}
+    r_n, g_n, b_n = [x / 255 for x in (r, g, b)]
+    def f(c): return ((c + 0.055) / 1.055) ** 2.4 if c > 0.04045 else c / 12.92
+    R, G, B = f(r_n), f(g_n), f(b_n)
+    X = R*0.4124 + G*0.3576 + B*0.1805
+    Y = R*0.2126 + G*0.7152 + B*0.0722
+    Z = R*0.0193 + G*0.1192 + B*0.9505
+    X/=0.95047; Z/=1.08883
+    def fl(t): return t**(1/3) if t>0.008856 else 7.787*t+0.13793
+    L=116*fl(Y)-16; a=500*(fl(X)-fl(Y)); b=200*(fl(Y)-fl(Z))
+    return {"l":round(L,2),"a":round(a,2),"b":round(b,2)}
 
-def extract_dominant_color(image_bytes: bytes) -> dict:
-    try:
-        img = Image.open(BytesIO(image_bytes)).convert("RGB")
-        # small guard: if image too small, resize up
-        w, h = img.size
-        if w < 50 or h < 50:
-            img = img.resize((max(150, w*3), max(150, h*3)))
-        img = img.resize((150, 150))
-        pixels = np.array(img).reshape(-1, 3)
-        # if too few pixels, just average
-        if pixels.shape[0] < 10:
-            avg = pixels.mean(axis=0)
-            r, g, b = [int(round(x)) for x in avg]
-            return {"r": r, "g": g, "b": b}
-        k = min(5, len(pixels))
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(pixels)
-        counts = np.bincount(labels)
-        dominant = kmeans.cluster_centers_[counts.argmax()]
-        r, g, b = [int(round(x)) for x in dominant]
-        return {"r": r, "g": g, "b": b}
-    except Exception as e:
-        logger.exception("extract_dominant_color failed")
-        # fallback to a neutral gray
-        return {"r": 128, "g": 128, "b": 128}
+def extract_dominant_color(image_bytes):
+    img = Image.open(BytesIO(image_bytes)).convert("RGB").resize((150,150))
+    pixels = np.array(img).reshape(-1,3)
+    k = min(5, len(pixels))
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10).fit(pixels)
+    c = kmeans.cluster_centers_[np.bincount(kmeans.labels_).argmax()]
+    r,g,b = [int(x) for x in c]
+    return {"r":r,"g":g,"b":b}
 
 # -------------------------------
-# Gemini helper (defensive)
+# Gemini Helper
 # -------------------------------
-def gemini_image_call(model_name: str, prompt: str, image_bytes: bytes) -> str:
-    """
-    Return string result from Gemini model. Raises Exception on hard fail.
-    This function is defensive: it attempts to extract text from various shapes of response.
-    """
-    if not HAVE_GENAI:
-        raise RuntimeError("Generative AI SDK not installed")
+def gemini_image_call(model, prompt, img_bytes):
+    if not (HAVE_GENAI and GEMINI_API_KEY):
+        raise RuntimeError("Gemini unavailable")
+
     try:
-        model = getattr(genai, "GenerativeModel")(model_name)
-        response = model.generate_content(
-            [
-                {"mime_type": "image/jpeg", "data": image_bytes},
-                prompt
-            ]
-        )
-        # try multiple extraction strategies
-        if hasattr(response, "text"):
-            return response.text
-        if hasattr(response, "candidates") and response.candidates:
-            try:
-                part = response.candidates[0]
-                # many SDK variants: try .content.parts[0].text
-                if hasattr(part, "content") and hasattr(part.content, "parts"):
-                    return part.content.parts[0].text
-                if hasattr(part, "text"):
-                    return part.text
-                return str(part)
-            except Exception:
-                return str(response)
-        return str(response)
+        m = genai.GenerativeModel(model)
+        resp = m.generate_content([
+            {"mime_type":"image/jpeg","data":img_bytes},
+            prompt
+        ])
+        if hasattr(resp, "text"):
+            return resp.text
+        return str(resp)
     except Exception as e:
-        logger.warning("Gemini image call failed: %s", e)
+        logger.warning("Gemini failed: %s", e)
         raise
 
 # -------------------------------
-# AI analysis workflows
+# AI Logic
 # -------------------------------
-async def run_reference_look(image_bytes: bytes) -> dict:
-    """
-    Try Gemini first (if available), otherwise fallback to local dominant color.
-    Expect JSON: { "r": int, "g": int, "b": int }
-    """
+async def run_reference_look(img):
     prompt = """
-You are an image analyzer. If the image contains a face and lips, return ONLY the RGB color of the lipstick on the lips.
-If no face/lips present, return the dominant lipstick/swatch RGB.
-Return JSON only in the exact form:
-{ "r": 123, "g": 45, "b": 67 }
+Return lipstick RGB only as:
+{ "r":123, "g":45, "b":67 }
 """
-    # attempt Gemini if possible
     if HAVE_GENAI and GEMINI_API_KEY:
         try:
-            text = gemini_image_call("gemini-2.5-flash", prompt, image_bytes)
-            # try to parse JSON strictly
-            data = json.loads(text)
-            if all(k in data for k in ("r", "g", "b")):
-                return {"r": int(data["r"]), "g": int(data["g"]), "b": int(data["b"])}
-            # try to extract digits with fallback
-            import re
-            m = re.search(r"(\d{1,3}).*?(\d{1,3}).*?(\d{1,3})", text)
-            if m:
-                return {"r": int(m.group(1)), "g": int(m.group(2)), "b": int(m.group(3))}
-            logger.info("Gemini returned unexpected data for reference_look, falling back")
-        except Exception as e:
-            logger.info("Gemini reference_look failed, falling back to local extraction: %s", e)
-    # local fallback
-    return extract_dominant_color(image_bytes)
+            txt = gemini_image_call("gemini-2.5-flash", prompt, img)
+            data = json.loads(txt)
+            if all(k in data for k in ("r","g","b")):
+                return {k:int(data[k]) for k in ("r","g","b")}
+        except Exception:
+            pass
 
-async def run_event_look(image_bytes: bytes) -> dict:
-    """
-    Try Gemini to extract detailed person+outfit attributes and 3 shade recommendations.
-    Expect strict JSON containing fields listed in prompt.
-    """
+    return extract_dominant_color(img)
+
+async def run_event_look(img):
     prompt = """
-Analyze the person AND their outfit from the same image.
-Detect:
-- skin_tone
-- undertone
-- hair_color
-- eye_color
-- outfit_color
-
-Then based on BOTH face + outfit, recommend EXACTLY 3 lipstick shades.
-
-Return strict JSON:
+Analyze face + outfit. Return:
 {
-  "skin_tone": "",
-  "undertone": "",
-  "hair_color": "",
-  "eye_color": "",
-  "outfit_color": "",
-  "best_shades": ["Shade1","Shade2","Shade3"]
+ "skin_tone":"",
+ "undertone":"",
+ "hair_color":"",
+ "eye_color":"",
+ "outfit_color":"",
+ "best_shades":["A","B","C"]
 }
 """
     if HAVE_GENAI and GEMINI_API_KEY:
         try:
-            text = gemini_image_call("gemini-2.5-flash", prompt, image_bytes)
-            data = json.loads(text)
-            return data
-        except Exception as e:
-            logger.info("Gemini event_look failed or returned unparsable JSON, falling back: %s", e)
-            # we still attempt a graceful fallback with limited info
-    # fallback: limited local response
-    dom = extract_dominant_color(image_bytes)
-    hexc = rgb_to_hex(dom["r"], dom["g"], dom["b"])
+            txt = gemini_image_call("gemini-2.5-flash", prompt, img)
+            return json.loads(txt)
+        except:
+            pass
+
+    dom = extract_dominant_color(img)
+    hex_c = rgb_to_hex(dom["r"],dom["g"],dom["b"])
     return {
-        "skin_tone": "unknown",
-        "undertone": "unknown",
-        "hair_color": "unknown",
-        "eye_color": "unknown",
-        "outfit_color": hexc,
-        "best_shades": [hexc, hexc, hexc]
+        "skin_tone":"unknown",
+        "undertone":"unknown",
+        "hair_color":"unknown",
+        "eye_color":"unknown",
+        "outfit_color":hex_c,
+        "best_shades":[hex_c,hex_c,hex_c]
     }
 
 # -------------------------------
-# API: Auth
+# Auth Routes
 # -------------------------------
 @api.post("/auth/register")
-async def register(user: UserRegister):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    existing = await db.users.find_one({"email": user.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already exists")
-    user_id = str(uuid.uuid4())
+async def register(u: UserRegister):
+    if await db.users.find_one({"email": u.email}):
+        raise HTTPException(400, "Email exists")
+
+    uid = str(uuid.uuid4())
     doc = {
-        "id": user_id,
-        "email": user.email,
-        "full_name": user.full_name,
-        "password_hash": hash_password(user.password),
+        "id": uid,
+        "email": u.email,
+        "full_name": u.full_name,
+        "password_hash": hash_password(u.password),
         "created_at": datetime.utcnow().isoformat()
     }
     await db.users.insert_one(doc)
-    token = create_token({"sub": user_id})
-    safe = {k: v for k, v in doc.items() if k != "password_hash"}
-    return {"token": token, "user": safe}
+    doc.pop("password_hash")
+    return {"token": create_token({"sub": uid}), "user": doc}
 
 @api.post("/auth/login")
-async def login(credentials: UserLogin):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    user_doc = await db.users.find_one({"email": credentials.email})
-    if not user_doc:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not verify_password(credentials.password, user_doc.get("password_hash", "")):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    user_doc.pop("password_hash", None)
-    user_doc.pop("_id", None)
-    if isinstance(user_doc.get("created_at"), str):
-        try:
-            user_doc["created_at"] = datetime.fromisoformat(user_doc["created_at"])
-        except Exception:
-            user_doc["created_at"] = datetime.utcnow()
-    token = create_token({"sub": user_doc["id"]})
-    return {"token": token, "user": user_doc}
+async def login(u: UserLogin):
+    user = await db.users.find_one({"email": u.email})
+    if not user or not verify_password(u.password, user["password_hash"]):
+        raise HTTPException(401, "Invalid credentials")
+    user.pop("password_hash")
+    user.pop("_id")
+    return {"token": create_token({"sub": user["id"]}), "user": user}
 
 @api.get("/auth/me")
-async def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+async def me(user: User = Depends(get_current_user)): return user
 
 @api.put("/auth/profile")
-async def update_profile(profile: UserProfile, current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    update = {}
-    if profile.skin_tone is not None:
-        update["skin_tone"] = profile.skin_tone
-    if profile.hair_color is not None:
-        update["hair_color"] = profile.hair_color
-    if update:
-        await db.users.update_one({"id": current_user.id}, {"$set": update})
-    return {"message": "Profile updated successfully"}
+async def update_profile(p:UserProfile, user:User=Depends(get_current_user)):
+    updates={k:v for k,v in p.dict().items() if v is not None}
+    if updates:
+        await db.users.update_one({"id":user.id},{"$set":updates})
+    return {"message":"Profile updated"}
 
 # -------------------------------
-# Shades endpoints
+# Shades Routes
 # -------------------------------
 @api.get("/shades")
-async def get_shades(current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    shades = await db.shades.find({"user_id": current_user.id}, {"_id": 0}).to_list(length=1000)
-    # normalize created_at
-    for s in shades:
-        if isinstance(s.get("created_at"), str):
-            try:
-                s["created_at"] = datetime.fromisoformat(s["created_at"])
-            except Exception:
-                s["created_at"] = datetime.utcnow()
-    return {"count": len(shades), "shades": shades}
+async def get_shades(user:User=Depends(get_current_user)):
+    shades=await db.shades.find({"user_id":user.id},{"_id":0}).to_list(999)
+    return {"count":len(shades),"shades":shades}
 
 @api.post("/shades")
-async def create_shade(shade: ShadeCreate, current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    shade_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
-    doc = {
-        "id": shade_id,
-        "user_id": current_user.id,
-        "name": shade.name,
-        "rgb": shade.rgb,
-        "lab": shade.lab,
-        "hex_color": shade.hex_color,
-        "source": shade.source,
-        "created_at": now
-    }
+async def create_shade(s:ShadeCreate,user:User=Depends(get_current_user)):
+    sid=str(uuid.uuid4())
+    doc={"id":sid,"user_id":user.id,**s.dict(),"created_at":datetime.utcnow().isoformat()}
     await db.shades.insert_one(doc)
-    doc.pop("_id", None)
+    doc.pop("_id",None)
     return doc
 
-@api.delete("/shades/{shade_id}")
-async def delete_shade(shade_id: str, current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    res = await db.shades.delete_one({"id": shade_id, "user_id": current_user.id})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Shade not found")
-    return {"message": "Shade deleted successfully"}
+@api.delete("/shades/{sid}")
+async def delete_shade(sid:str,user:User=Depends(get_current_user)):
+    r=await db.shades.delete_one({"id":sid,"user_id":user.id})
+    if r.deleted_count==0:
+        raise HTTPException(404,"Shade not found")
+    return {"message":"Deleted"}
 
 # -------------------------------
-# Devices endpoints
+# Device Routes
 # -------------------------------
 @api.post("/device/connect")
-async def connect_device(current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    existing = await db.device_sessions.find_one({"user_id": current_user.id, "status": "connected"})
+async def connect_device(user:User=Depends(get_current_user)):
+    existing=await db.device_sessions.find_one({"user_id":user.id,"status":"connected"})
     if existing:
-        return {"message": "Device already connected", "device_id": existing["device_id"]}
-    session_id = str(uuid.uuid4())
-    doc = {
-        "id": session_id,
-        "user_id": current_user.id,
-        "device_id": "LipstickDispenser",
-        "status": "connected",
-        "connected_at": datetime.utcnow().isoformat(),
-        "last_shade_dispensed": None
-    }
+        return {"message":"Already connected","device_id":existing["device_id"]}
+    sid=str(uuid.uuid4())
+    doc={"id":sid,"user_id":user.id,"device_id":"LipstickDispenser",
+         "status":"connected","connected_at":datetime.utcnow().isoformat(),
+         "last_shade_dispensed":None}
     await db.device_sessions.insert_one(doc)
-    return {"message": "Device connected successfully", "device_id": doc["device_id"]}
+    return {"message":"Device connected","device_id":"LipstickDispenser"}
 
 @api.post("/device/disconnect")
-async def disconnect_device(current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    await db.device_sessions.update_many({"user_id": current_user.id, "status": "connected"}, {"$set": {"status": "disconnected"}})
-    return {"message": "Device disconnected successfully"}
+async def disconnect_device(user:User=Depends(get_current_user)):
+    await db.device_sessions.update_many({"user_id":user.id},{"$set":{"status":"disconnected"}})
+    return {"message":"Disconnected"}
 
 @api.get("/device/status")
-async def device_status(current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    session = await db.device_sessions.find_one({"user_id": current_user.id, "status": "connected"}, {"_id": 0})
-    if not session:
-        return {"connected": False}
-    return {"connected": True, "device_id": session["device_id"], "status": session["status"]}
+async def device_status(user:User=Depends(get_current_user)):
+    s=await db.device_sessions.find_one({"user_id":user.id,"status":"connected"},{"_id":0})
+    return {"connected":bool(s),**(s or {})}
 
 @api.post("/device/dispense")
-async def dispense_shade(payload: dict, current_user: User = Depends(get_current_user)):
-    """
-    Expects JSON body { "shade_id": "<id>" }
-    """
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    shade_id = payload.get("shade_id")
-    if not shade_id:
-        raise HTTPException(status_code=400, detail="Missing shade_id")
-    session = await db.device_sessions.find_one({"user_id": current_user.id, "status": "connected"})
-    if not session:
-        raise HTTPException(status_code=400, detail="Device not connected")
-    shade = await db.shades.find_one({"id": shade_id, "user_id": current_user.id}, {"_id": 0})
-    if not shade:
-        raise HTTPException(status_code=404, detail="Shade not found")
-    await db.device_sessions.update_one({"id": session["id"]}, {"$set": {"status": "dispensing", "last_shade_dispensed": shade}})
-    # simulate dispensing
+async def dispense(data:dict,user:User=Depends(get_current_user)):
+    sid=data.get("shade_id")
+    if not sid: raise HTTPException(400,"Missing shade_id")
+    session=await db.device_sessions.find_one({"user_id":user.id,"status":"connected"})
+    if not session: raise HTTPException(400,"Device not connected")
+    shade=await db.shades.find_one({"id":sid,"user_id":user.id},{"_id":0})
+    if not shade: raise HTTPException(404,"Shade not found")
+
+    await db.device_sessions.update_one({"id":session["id"]},{"$set":{"status":"dispensing"}})
     await asyncio.sleep(1.2)
-    await db.device_sessions.update_one({"id": session["id"]}, {"$set": {"status": "connected"}})
-    mix = {
-        "cyan": round(255 - shade["rgb"]["r"], 2),
-        "magenta": round(255 - shade["rgb"]["g"], 2),
-        "yellow": round(255 - shade["rgb"]["b"], 2),
-        "black": round((255 - max(shade["rgb"]["r"], shade["rgb"]["g"], shade["rgb"]["b"])) * 0.3, 2)
+    await db.device_sessions.update_one({"id":session["id"]},{"$set":{"status":"connected"}})
+
+    mix={
+        "cyan":255-shade["rgb"]["r"],
+        "magenta":255-shade["rgb"]["g"],
+        "yellow":255-shade["rgb"]["b"],
+        "black":round((255-max(shade["rgb"].values()))*0.3,2)
     }
-    return {"message": "Shade dispensed successfully", "shade": shade, "mix_formula": mix}
+    return {"message":"Dispensed","shade":shade,"mix_formula":mix}
 
 # -------------------------------
-# Color analyze: supports UploadFile (multipart/form-data) or JSON {image_base64}
+# Color Analyze
 # -------------------------------
 @api.post("/analyze/color")
-async def analyze_color(request: Request, file: Optional[UploadFile] = File(None), current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
+async def analyze_color(request:Request,file:Optional[UploadFile]=File(None),
+                        user:User=Depends(get_current_user)):
 
-    image_bytes = None
-    # If file provided (multipart)
-    if file is not None:
-        try:
-            image_bytes = await file.read()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed reading file: {str(e)}")
+    if file:
+        img=await file.read()
     else:
-        # try JSON body
-        try:
-            body = await request.json()
-            img_b64 = body.get("image_base64") or body.get("image")
-            if not img_b64:
-                raise HTTPException(status_code=400, detail="No image provided")
-            image_bytes = base64.b64decode(img_b64)
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid request body or base64 image: {str(e)}")
+        body=await request.json()
+        img=base64.b64decode(body.get("image_base64") or body.get("image"))
 
-    rgb = extract_dominant_color(image_bytes)
-    lab = rgb_to_lab(rgb["r"], rgb["g"], rgb["b"])
-    hex_color = rgb_to_hex(rgb["r"], rgb["g"], rgb["b"])
+    rgb=extract_dominant_color(img)
+    lab=rgb_to_lab(rgb["r"],rgb["g"],rgb["b"])
+    hex_c=rgb_to_hex(rgb["r"],rgb["g"],rgb["b"])
 
     return {
-        "rgb": rgb,
-        "lab_values": lab,
-        "hex_color": hex_color,
-        "source": "local"
+        "dominant_color":rgb,
+        "lab_values":lab,
+        "hex_color":hex_c,
+        "source":"local"
     }
 
 # -------------------------------
-# AI Shade analyze: expects JSON { image_base64, analysis_type }
+# AI Shade (reference + event look)
 # -------------------------------
 @api.post("/analyze/ai-shade")
-async def analyze_ai_shade(req: AIShadeRequest, current_user: User = Depends(get_current_user)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    if not req.image_base64:
-        raise HTTPException(status_code=400, detail="image_base64 is required")
+async def analyze_ai(req:AIShadeRequest,user:User=Depends(get_current_user)):
+    img=base64.b64decode(req.image_base64)
 
-    try:
-        image_bytes = base64.b64decode(req.image_base64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 image")
-
-    if req.analysis_type == "reference_look":
-        rgb = await run_reference_look(image_bytes)
-        lab = rgb_to_lab(rgb["r"], rgb["g"], rgb["b"])
-        hex_color = rgb_to_hex(rgb["r"], rgb["g"], rgb["b"])
+    if req.analysis_type=="reference_look":
+        rgb=await run_reference_look(img)
+        lab=rgb_to_lab(rgb["r"],rgb["g"],rgb["b"])
+        hex_c=rgb_to_hex(rgb["r"],rgb["g"],rgb["b"])
         return {
-            "rgb": rgb,
-            "lab_values": lab,
-            "hex_color": hex_color,
-            "source": "ai" if HAVE_GENAI and GEMINI_API_KEY else "local"
+            "dominant_color":rgb,
+            "lab_values":lab,
+            "hex_color":hex_c,
+            "source":"ai" if (HAVE_GENAI and GEMINI_API_KEY) else "local"
         }
 
-    elif req.analysis_type == "event_look":
-        data = await run_event_look(image_bytes)
-        return {"analysis": data, "source": "ai" if HAVE_GENAI and GEMINI_API_KEY else "local"}
+    if req.analysis_type=="event_look":
+        data=await run_event_look(img)
+        return {
+            "analysis":data,
+            "source":"ai" if (HAVE_GENAI and GEMINI_API_KEY) else "local"
+        }
 
-    else:
-        raise HTTPException(status_code=400, detail="Invalid analysis_type")
+    raise HTTPException(400,"Invalid analysis_type")
 
 # -------------------------------
-# Liveness root (optional health)
+# Root
 # -------------------------------
 @api.get("/")
 async def root():
-    return {"message": "Aura Backend is running"}
+    return {"message":"Aura Backend Running"}
 
-# Attach router
 app.include_router(api)
-
-# Clean shutdown handler
-@app.on_event("shutdown")
-async def shutdown_hook():
-    if client:
-        client.close()
